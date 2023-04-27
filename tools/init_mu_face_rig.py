@@ -2,7 +2,7 @@ import json
 import numpy as np
 import torch
 from pytorch3d import transforms as trans
-from read_write_obj import read_obj_file
+from tools.read_write_obj import read_obj_file
 
 class BoneNode():
     def __init__(
@@ -29,19 +29,40 @@ class InitMuFaceRig():
             self.verts, 
             self.tri_indices, 
             self.uv_coords, 
-            self.uv_indices
+            self.uv_indices,
+            self.verts_uv_indices,
         ) = self.read_mu_face(mu_face_file)
         (
             self.bones_dict
         ) = self.read_rig(rig_info_file, self.verts)
+        # 根骨骼 "face" 不参与优化
+        self.bones_name = [k for k in self.bones_dict.keys() if k != "face"]
+        self.bones_list = [self.bones_dict[k] for k in self.bones_name]
+        self.bones_head_idx = [self.bones_dict[k].head_idx for k in self.bones_name]
+        self.bones_tail_idx = [self.bones_dict[k].tail_idx for k in self.bones_name]
+        self.bones_head_pos = torch.cat([self.bones_dict[k].head_pos for k in self.bones_name], dim=0)
+        self.bones_tail_pos = torch.cat([self.bones_dict[k].tail_pos for k in self.bones_name], dim=0)
+        self.bones_M_local2obj = torch.cat([self.bones_dict[k].M_local2obj for k in self.bones_name], dim=0)
 
     def read_mu_face(self, mu_face_file):
         verts, tri_indices, uv_coords, uv_indices = read_obj_file(mu_face_file)
+        uv_indices = uv_indices.reshape(-1,3)
+        verts_uv_indices = [None]*verts.shape[0]
+        for tri_idx in range(tri_indices.shape[0]):
+            id_abc = tri_indices[tri_idx]
+            uv_abc = uv_indices[tri_idx]
+            for i in range(3):
+                if verts_uv_indices[id_abc[i]] is None:
+                    verts_uv_indices[id_abc[i]] = uv_abc[i]
+        for idx in verts_uv_indices:
+            if idx is None:
+                print("WARN: there are some vertices not unprojected to UV space!")
         return (
             torch.tensor(verts, dtype=torch.float32),
             torch.tensor(tri_indices, dtype=torch.int32),
             torch.tensor(uv_coords, dtype=torch.float32),
-            torch.tensor(uv_indices, dtype=torch.int32)
+            torch.tensor(uv_indices, dtype=torch.int32),
+            torch.tensor(verts_uv_indices, dtype=torch.int32),
         )
 
     def read_rig(self, rig_info_file, verts):
@@ -58,7 +79,6 @@ class InitMuFaceRig():
         # 获取所有骨骼顶点的位置
         bones_dict = {}
         M_rig2obj = torch.matmul(M_world2obj, M_rig2world)
-        ic(M_rig2obj)
         trans2obj = trans.Transform3d(matrix=M_rig2obj.T)
         for name, bone in bones_info.items():
             head = torch.tensor(bone["head"], dtype=torch.float32)
@@ -81,36 +101,6 @@ class InitMuFaceRig():
         return bones_dict
 
 
-        
-        
-
-def find_correspond_vert(origin_verts, rig_info):
-    muface_info = rig_info["mu_face"]
-    origin_verts = torch.tensor(origin_verts, dtype=torch.float32)
-    
-    mat2world = torch.tensor(muface_info["matrix_world"], dtype=torch.float32)
-    print(mat2world)
-
-    trans2world = trans.Transform3d(matrix=mat2world.T)
-    # ic(origin_verts.shape)
-    verts = trans2world.transform_points(origin_verts)
-
-    # verts_ = verts.detach().cpu().numpy()
-    # fig=px.scatter_3d(x=verts_[:,0],y=verts_[:,1],z=verts_[:,2])
-    # fig.show()
-
-    bones_loc = get_bone_loc(rig_info)
-    ic(bones_loc)
-
-    locs_ = np.array([_ for _ in bones_loc.values()])[:,1]
-    ic(locs_)
-    verts_ = verts.numpy()
-    size = [20.0]*locs_.shape[0] + [0.1]*verts_.shape[0]
-    locs_ = np.concatenate([locs_, verts_])
-    
-    fig=px.scatter_3d(x=locs_[:,0],y=locs_[:,1],z=locs_[:,2],size=size)
-    fig.show()
-
 if __name__ == "__main__":
     import plotly.express as px
     from icecream import ic
@@ -119,8 +109,8 @@ if __name__ == "__main__":
     verts = init.verts
     indices = [b.tail_idx for b in init.bones_dict.values()]
     verts_ = verts[indices].numpy()
-    fig = px.scatter_3d(x=verts_[:,0], y=verts_[:,1], z=verts_[:,2])
-    fig.show()
+    # fig = px.scatter_3d(x=verts_[:,0], y=verts_[:,1], z=verts_[:,2])
+    # fig.show()
 
 
 
