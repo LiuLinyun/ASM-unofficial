@@ -86,8 +86,8 @@ class InitMuFaceRig():
             tail = torch.tensor(bone["tail"], dtype=torch.float32)
             head = trans2obj.transform_points(head.view(1,3))
             tail = trans2obj.transform_points(tail.view(1,3))
-            nearest_face_head_idx = torch.argmin(torch.pairwise_distance(head, verts))
-            nearest_face_tail_idx = torch.argmin(torch.pairwise_distance(tail, verts))
+            nearest_face_head_idx = torch.argmin(torch.cdist(head, verts))
+            nearest_face_tail_idx = torch.argmin(torch.cdist(tail, verts))
             M_local2rig = torch.tensor(bone["matrix"], dtype=torch.float32)
 
             bones_dict[name] = BoneNode(
