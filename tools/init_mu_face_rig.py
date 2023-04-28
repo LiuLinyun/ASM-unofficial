@@ -37,12 +37,13 @@ class InitMuFaceRig():
         ) = self.read_rig(rig_info_file, self.verts)
         # 根骨骼 "face" 不参与优化
         self.bones_name = [k for k in self.bones_dict.keys() if k != "face"]
+        self.bones_name_idx = dict([(k, i) for (i,k) in enumerate(self.bones_name)])
         self.bones_list = [self.bones_dict[k] for k in self.bones_name]
         self.bones_head_idx = [self.bones_dict[k].head_idx for k in self.bones_name]
         self.bones_tail_idx = [self.bones_dict[k].tail_idx for k in self.bones_name]
         self.bones_head_pos = torch.cat([self.bones_dict[k].head_pos for k in self.bones_name], dim=0)
         self.bones_tail_pos = torch.cat([self.bones_dict[k].tail_pos for k in self.bones_name], dim=0)
-        self.bones_M_local2obj = torch.cat([self.bones_dict[k].M_local2obj for k in self.bones_name], dim=0)
+        self.bones_M_local2obj = torch.cat([self.bones_dict[k].M_local2obj.unsqueeze(0) for k in self.bones_name], dim=0)
 
     def read_mu_face(self, mu_face_file):
         verts, tri_indices, uv_coords, uv_indices = read_obj_file(mu_face_file)
