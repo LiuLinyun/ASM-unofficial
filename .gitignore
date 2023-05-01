@@ -161,3 +161,4 @@ cython_debug/
 
 data/hifi3dpp.mat
 tmp/
+lightning_logs/
