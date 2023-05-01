@@ -36,9 +36,6 @@ class AsmModel(pl.LightningModule):
         self.tau_so3 = nn.Parameter(so3, requires_grad=True)
         self.tau_translation = nn.Parameter(translation, requires_grad=True)
 
-        # 预处理一些数据, 避免重复计算
-        self.pre_processing()
-
     def init_params(self):
         # 获得骨骼初始的 UV 坐标, 以初始化 zeta
         zeta = self.init_state.uv_coords[self.init_state.verts_uv_indices[self.init_state.bones_tail_idx]]
@@ -56,6 +53,7 @@ class AsmModel(pl.LightningModule):
             T = torch.matmul(M_parent2world.inverse(), M_curr2world).unsqueeze(0)
             M_local_trans_list.append(T)
         M_local = torch.cat(M_local_trans_list, dim=0)
+        
         # 分解变换矩阵, 得到位移, 旋转, 缩放
         sR = M_local[:,:3,:3]
         s = torch.norm(sR, dim=1, keepdim=True)
@@ -64,33 +62,25 @@ class AsmModel(pl.LightningModule):
         T = M_local[:,:3,3]
         return zeta, s.view(-1,3), so3, T
 
-    def pre_processing(self):
-        self.psi_init = init_state.bones_tail_pos
-        # (J, 3)
-        self.vt = self.init_state.verts[self.init_state.bones_tail_idx]
+    def gmm_weighting(self):
+        # (V, 2) V means verts_cnt
+        vert_uvs = self.init_state.uv_coords[self.init_state.verts_uv_indices]
+        mu = (self.mu + self.zeta) # (J, K, 2)
+        # x-mu: (V, 1, 2) - (J*K, 2) -> (V, J*K, 2)
+        x_mu = vert_uvs.view(-1,1,2) - mu.view(-1,2)
         # (J, K, 1) -> (J, K, 4) -> (J, K, 2, 2)
-        self.sigma_mat = torch.cat([self.sigma[:,:,[1]], self.sigma[:,:,[0]], 
+        sigma_mat = torch.cat([self.sigma[:,:,[1]], self.sigma[:,:,[0]], 
             self.sigma[:,:,[0]], self.sigma[:,:,[2]]], dim = -1).view(self.J, self.K, 2, 2)
         # 1/(2*pi*|Sigma|^0.5) , shape (J, K)
-        self.inv_2pi_sqrt_sigma_det = 1 / ((2*torch.pi) * torch.sqrt(torch.det(self.sigma_mat)))
-        # (tri_cnt, 3, 2)
-        # self.tri_uvs = self.init_state.uv_coords[self.init_state.uv_indices]
-        # (V, 2) V means verts_cnt
-        self.vert_uvs = self.init_state.uv_coords[self.init_state.verts_uv_indices]
-
-    def gmm_weighting(self):
-        mu = (self.mu + self.zeta) # (J, K, 2)
-        # (V, 1, 2) - (J*K, 2) -> (V, J*K, 2)
-        x_mu = self.vert_uvs.view(-1,1,2) - mu.view(-1,2)
-        pi = torch.normalize(self.pi, dim=1) # (J, K)
+        inv_2pi_sqrt_sigma_det = 1 / ((2*torch.pi) * torch.sqrt(torch.det(sigma_mat)))
+        pi = self.pi / torch.sum(self.pi, dim=1, keepdim=True) # (J, K), normalize pi
         # (J,K) -> (J*K, 1) 
-        pi_alpha = (pi*self.inv_2pi_sqrt_sigma_det).view(-1,1)
+        pi_alpha = (pi*inv_2pi_sqrt_sigma_det).view(-1,1)
         # (V, J*K, 1, 2) @ (J*K,2,2) @ (V, J*K, 2, 1) -> (V, J*K, 1)
-        index = x_mu.squeeze(-2).bmm(self.sigma_mat.view(-1,2,2)).bmm(x_mu.squeeze(-1)) / (-2)
+        index = x_mu.unsqueeze(-2).matmul(sigma_mat.view(-1,2,2)).matmul(x_mu.unsqueeze(-1)).squeeze(-1) / (-2)
         # (V, J, K)
-        w = pi_alpha*torch.exp(index).reshape(-1, self.J, self.K)
-        w = torch.sum(w, dim=-1) # (V, J)
-        wg = w / torch.sum(w, dim=-1).squeeze(-1) # (V, J)
+        w = torch.mul(pi_alpha, torch.exp(index)).reshape(-1, self.J, self.K)
+        wg = torch.div(w, torch.sum(w, dim=-1, keepdim=True)).squeeze(-1) # (V, J)
         return wg
 
     def bones_local2world(self):
@@ -116,11 +106,13 @@ class AsmModel(pl.LightningModule):
     
     def dyn_binding(self):
         # psi = self.mesh_uv_projecter.uv2mesh(self.zeta) - self.vt + self.psi_init
-        # TODO: 更新 BindPose 变换矩阵 ? 怎么实现?
-        # ANS: B' = TB, T 为世界坐标系下骨骼的变换, 这里只有平移
-        # B 就是骨骼的 matrix
+        # 但是实际计算只需要骨骼顶点 psi 的变化量 delta_psi
+        # 更新的绑定姿态矩阵 B' = TB
+        # T 为世界坐标系下骨骼的变换(这里只有平移)
+        # B 就是骨骼原绑定姿态的local2world matrix
+        vt = self.init_state.verts[self.init_state.bones_tail_idx]
         # (J, 3)
-        delta_psi = self.mesh_uv_projecter.uv2mesh(self.zeta.view(-1,2)) - self.vt
+        delta_psi = self.mesh_uv_projecter.uv2mesh(self.zeta.view(-1,2)) - vt
         # (J,4,4)
         B = self.init_state.bones_M_local2obj
         # 添加平移 
@@ -128,10 +120,23 @@ class AsmModel(pl.LightningModule):
         B_inv = B.inverse()
         return B_inv
 
+    def update_verts(self):
+        W = self.gmm_weighting() # (V, J)
+        M_l2w = self.bones_local2world() # (J, 4, 4)
+        B_inv = self.dyn_binding() # (J, 4, 4)
+        v = self.init_state.verts # (V,3)
+        combined_trans = trans.Transform3d(matrix=torch.matmul(M_l2w,B_inv).transpose(-1,-2))
+        v_weighted = combined_trans.transform_points(v)
+        v_updated = torch.sum(v_weighted, dim=0)
+        return v_updated
+
 if __name__ == "__main__":
     init_state = InitMuFaceRig("data/rig_info.json", "data/mu_face.obj")
     model = AsmModel(2, init_state)
-    model.pre_processing()
     M1 = model.bones_local2world()
     M2 = model.dyn_binding()
-    # ic(torch.bmm(M1,M2))
+    v = model.init_state.verts
+    v_ = model.update_verts()
+    cos_dist = torch.cosine_similarity(v, v_)
+    ic(cos_dist)
+
