@@ -1,6 +1,8 @@
+import random
 import torch 
 import torch.nn as nn
-import torch.functional as F
+import torch.nn.functional as F
+from torch.utils.data import Dataset
 import pytorch_lightning as pl
 from pytorch3d import transforms as trans
 
@@ -8,15 +10,32 @@ import sys
 sys.path.append('.')
 from tools.init_mu_face_rig import InitMuFaceRig
 from tools.mesh_utils import MeshUVProjecter
+from tools.face_dataset import basis_exp
 
 from icecream import ic
 
+def gen_face_with_expression(mu_face):
+    E = basis_exp.shape[0]
+    face = mu_face + basis_exp[random.randint(0,E)]
+    return torch.tensor(face)
+    
+class VirtDataset(Dataset):
+    def __init__(self):
+        super().__init__()
+    def __len__(self):
+        return 1
+    def __getitem__(self, idx):
+        return idx
+
 class AsmModel(pl.LightningModule):
-    def __init__(self, K, init_mu_face_rig):
+    def __init__(self, K, init_mu_face_rig, base_verts, tgt_verts):
         super().__init__()
         J = len(init_mu_face_rig.bones_name)
         self.J = J
         self.K = K 
+        self.B = tgt_verts.size() # batch_sie
+        self.base_verts = base_verts
+        self.tgt_verts = tgt_verts
         self.init_state = init_mu_face_rig
         self.mesh_uv_projecter = MeshUVProjecter(
             self.init_state.verts,
@@ -116,8 +135,12 @@ class AsmModel(pl.LightningModule):
         # (J,4,4)
         B = self.init_state.bones_M_local2obj
         # 添加平移 
-        B[:,:3,3] += delta_psi
-        B_inv = B.inverse()
+        # B[:,:3,3] += delta_psi
+        B_ = torch.empty_like(B)
+        B_[:,:,:3] = B[:,:,:3]
+        B_[:,:,3] = B[:,:,3]
+        B_[:,:3,3] = B[:,:3,3] + delta_psi
+        B_inv = B_.inverse()
         return B_inv
 
     def update_verts(self):
@@ -129,10 +152,25 @@ class AsmModel(pl.LightningModule):
         v_weighted = combined_trans.transform_points(v)
         v_updated = torch.sum(v_weighted, dim=0)
         return v_updated
+    
+    def forward(self, x):
+        v = self.update_verts()
+        return v
+
+    def training_step(self, batch, batch_idx):
+        v = self(None)
+        loss = F.mse_loss(v, self.tgt_verts)
+        self.log("loss", loss, prog_bar=True)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.01)
+        return optimizer
 
 if __name__ == "__main__":
-    init_state = InitMuFaceRig("data/rig_info.json", "data/mu_face.obj")
-    model = AsmModel(2, init_state)
+    muface_rig = InitMuFaceRig("data/rig_info.json", "data/mu_face.obj")
+    tgt_verts = gen_face_with_expression(muface_rig.verts)
+    model = AsmModel(15, muface_rig, base_verts=muface_rig.verts, tgt_verts=tgt_verts)
     M1 = model.bones_local2world()
     M2 = model.dyn_binding()
     v = model.init_state.verts
