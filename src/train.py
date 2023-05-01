@@ -2,8 +2,6 @@ import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 
-import sys
-sys.path.append('.')
 from tools.init_mu_face_rig import InitMuFaceRig
 from model import gen_face_with_expression, VirtDataset, AsmModel
 

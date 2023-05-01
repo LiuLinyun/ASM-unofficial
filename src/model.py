@@ -6,8 +6,6 @@ from torch.utils.data import Dataset
 import pytorch_lightning as pl
 from pytorch3d import transforms as trans
 
-import sys
-sys.path.append('.')
 from tools.init_mu_face_rig import InitMuFaceRig
 from tools.mesh_utils import MeshUVProjecter
 from tools.face_dataset import basis_exp
