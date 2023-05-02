@@ -160,5 +160,6 @@ cython_debug/
 #.idea/
 
 data/hifi3dpp.mat
+data/output/
 tmp/
 lightning_logs/

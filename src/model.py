@@ -1,3 +1,4 @@
+import os
 import random
 import torch 
 import torch.nn as nn
@@ -9,6 +10,7 @@ from pytorch3d import transforms as trans
 from tools.init_mu_face_rig import InitMuFaceRig
 from tools.mesh_utils import MeshUVProjecter
 from tools.face_dataset import basis_exp
+from tools.read_write_obj import write_obj_file
 
 from icecream import ic
 
@@ -18,10 +20,11 @@ def gen_face_with_expression(mu_face):
     return torch.tensor(face)
     
 class VirtDataset(Dataset):
-    def __init__(self):
+    def __init__(self, cnt=1):
         super().__init__()
+        self.cnt = cnt
     def __len__(self):
-        return 1
+        return self.cnt
     def __getitem__(self, idx):
         return idx
 
@@ -80,11 +83,9 @@ class AsmModel(pl.LightningModule):
         return zeta, s.view(-1,3), so3, T
 
     def gmm_weighting(self):
-        # (V, 2) V means verts_cnt
-        vert_uvs = self.init_state.uv_coords[self.init_state.verts_uv_indices]
         mu = (self.mu + self.zeta) # (J, K, 2)
         # x-mu: (V, 1, 2) - (J*K, 2) -> (V, J*K, 2)
-        x_mu = vert_uvs.view(-1,1,2) - mu.view(-1,2)
+        x_mu = self.init_state.bones_uvs.view(-1,1,2) - mu.view(-1,2)
         # (J, K, 1) -> (J, K, 4) -> (J, K, 2, 2)
         sigma_mat = torch.cat([self.sigma[:,:,[1]], self.sigma[:,:,[0]], 
             self.sigma[:,:,[0]], self.sigma[:,:,[2]]], dim = -1).view(self.J, self.K, 2, 2)
@@ -127,7 +128,7 @@ class AsmModel(pl.LightningModule):
         # 更新的绑定姿态矩阵 B' = TB
         # T 为世界坐标系下骨骼的变换(这里只有平移)
         # B 就是骨骼原绑定姿态的local2world matrix
-        vt = self.init_state.verts[self.init_state.bones_tail_idx]
+        vt = self.init_state.bones_tail_pos
         # (J, 3)
         delta_psi = self.mesh_uv_projecter.uv2mesh(self.zeta.view(-1,2)) - vt
         # (J,4,4)
@@ -151,6 +152,30 @@ class AsmModel(pl.LightningModule):
         v_updated = torch.sum(v_weighted, dim=0)
         return v_updated
     
+    def save_mesh(self, path):
+        src_mesh_path = os.path.join(path, "src.obj")
+        tgt_mesh_path = os.path.join(path, "tgt.obj")
+        with torch.no_grad():
+            src_verts = self.update_verts().detach().cpu().numpy()
+            tgt_verts = self.tgt_verts.detach().cpu().numpy()
+            tri_indices = self.init_state.tri_indices.detach().cpu().numpy()
+            uv_coords = self.init_state.uv_coords.detach().cpu().numpy()
+            uv_indices = self.init_state.uv_indices.view(-1).detach().cpu().numpy()
+        write_obj_file(
+            src_mesh_path,
+            src_verts,
+            tri_indices,
+            uv_coords,
+            uv_indices,
+        )
+        write_obj_file(
+            tgt_mesh_path,
+            tgt_verts,
+            tri_indices,
+            uv_coords,
+            uv_indices,
+        )
+    
     def forward(self, x):
         v = self.update_verts()
         return v
@@ -159,6 +184,10 @@ class AsmModel(pl.LightningModule):
         v = self(None)
         loss = F.mse_loss(v, self.tgt_verts)
         self.log("loss", loss, prog_bar=True)
+        with torch.no_grad():
+            dist = torch.cdist(v, self.tgt_verts)
+            max_dist = torch.max(dist)
+            self.log("max_dist", max_dist, prog_bar=True)
         return loss
 
     def configure_optimizers(self):

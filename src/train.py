@@ -7,8 +7,9 @@ from model import gen_face_with_expression, VirtDataset, AsmModel
 
 muface_rig = InitMuFaceRig("data/rig_info.json", "data/mu_face.obj")
 tgt_verts = gen_face_with_expression(muface_rig.verts)
-dataset = VirtDataset()
+dataset = VirtDataset(1000)
 data_loader = DataLoader(dataset, batch_size=1)
-model = AsmModel(15, muface_rig, base_verts=muface_rig.verts, tgt_verts=tgt_verts)
-trainer = pl.Trainer(max_epochs=1000)
+model = AsmModel(5, muface_rig, base_verts=muface_rig.verts, tgt_verts=tgt_verts)
+trainer = pl.Trainer(max_epochs=1)
 trainer.fit(model, train_dataloaders=data_loader)
+model.save_mesh("data/output")
