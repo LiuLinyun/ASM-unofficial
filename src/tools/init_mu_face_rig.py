@@ -44,6 +44,8 @@ class InitMuFaceRig():
         self.bones_head_pos = torch.cat([self.bones_dict[k].head_pos for k in self.bones_name], dim=0)
         self.bones_tail_pos = torch.cat([self.bones_dict[k].tail_pos for k in self.bones_name], dim=0)
         self.bones_M_local2obj = torch.cat([self.bones_dict[k].M_local2obj.unsqueeze(0) for k in self.bones_name], dim=0)
+        self.verts_uvs = self.uv_coords[self.verts_uv_indices]
+        self.bones_uvs = self.verts_uvs[self.bones_tail_idx]
 
     def read_mu_face(self, mu_face_file):
         verts, tri_indices, uv_coords, uv_indices = read_obj_file(mu_face_file)
@@ -73,7 +75,7 @@ class InitMuFaceRig():
         # 从 rig_file_info 的世界空间转到对象空间的变换矩阵
         M_world2obj = torch.tensor(mu_face_info["matrix_world"], dtype=torch.float32).inverse()
 
-        # 从所有骨骼的对象空间到世界空间的变换矩阵(FIXME later .T)
+        # 从所有骨骼的对象空间到世界空间的变换矩阵
         M_rig2world = torch.tensor(rig_info["metarig"]["matrix_world"], dtype=torch.float32)
         bones_info = rig_info["metarig"]["bones"]
         
@@ -107,11 +109,13 @@ if __name__ == "__main__":
     from icecream import ic
 
     init = InitMuFaceRig("data/rig_info.json", "data/mu_face.obj")
-    verts = init.verts
-    indices = [b.tail_idx for b in init.bones_dict.values()]
-    verts_ = verts[indices].numpy()
-    # fig = px.scatter_3d(x=verts_[:,0], y=verts_[:,1], z=verts_[:,2])
+    print(init.bones_name)
+    bones_tail = init.bones_tail_pos.detach().cpu().numpy()
+    fig = px.scatter_3d(x=bones_tail[:,0], y=bones_tail[:,1], z=bones_tail[:,2])
     # fig.show()
+    v = init.verts[init.bones_tail_idx].detach().cpu().numpy()
+    fig = px.scatter_3d(x=v[:,0], y=v[:,1], z=v[:,2])
+    fig.show()
 
 
 

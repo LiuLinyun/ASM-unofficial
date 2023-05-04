@@ -78,7 +78,7 @@ if __name__ == "__main__":
     ])
 
     # 写入.obj文件
-    write_obj_file('data/example.obj', vertices, faces, texture_coords, texture_indices)
+    write_obj_file('data/output/example.obj', vertices, faces, texture_coords, texture_indices)
 
     # 读取.obj文件
     read_vertices, read_faces, read_texture_coords, read_texture_indices = read_obj_file('data/example.obj')

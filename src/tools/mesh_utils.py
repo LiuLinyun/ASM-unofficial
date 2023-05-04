@@ -1,15 +1,17 @@
 import torch
+from torch import nn
 from icecream import ic
 
 def cross2d(x, y):
     # X (*,2), Y (*,2) -> (*)
     return x[...,0]*y[...,1] - x[...,1]*y[...,0]
 
-class MeshUVProjecter():
+class MeshUVProjecter(nn.Module):
     def __init__(self, verts, tri_indices, uv_coords, uv_indices):
-        self.tri_verts = verts[tri_indices] # (tri_cnt, 3, 3)
-        self.tri_uvs = uv_coords[uv_indices] # (tri_cnt, 3, 2)
-        self.tri_uv_center = torch.sum(self.tri_uvs, dim=1)/3
+        super().__init__()
+        self.tri_verts = nn.Parameter(verts[tri_indices], requires_grad=False) # (tri_cnt, 3, 3)
+        self.tri_uvs = nn.Parameter(uv_coords[uv_indices], requires_grad=False) # (tri_cnt, 3, 2)
+        self.tri_uv_center = nn.Parameter(torch.sum(self.tri_uvs, dim=1)/3, requires_grad=False) 
 
     def uv2mesh(self, uvs):
         # 找到 uv 坐标最近的三角形
@@ -23,7 +25,6 @@ class MeshUVProjecter():
         beta = s1 / s_total
         gamma = 1 - (alpha + beta)
         bary = torch.cat([alpha.view(-1,1), beta.view(-1,1), gamma.view(-1,1)], dim=1).view(-1, 3, 1)
-
         tri = self.tri_verts[tri_idx] # (N, 3, 3)
         return torch.sum(bary*tri, dim=1)
 
