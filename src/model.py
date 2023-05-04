@@ -15,13 +15,17 @@ from tools.read_write_obj import write_obj_file
 
 from icecream import ic
 
+def softweight(x, dim=-1):
+    # 先对所有的数做softplus
+    x = F.softplus(x)
+    sum = torch.sum(x, dim=dim, keepdim=True)
+    return torch.div(x, sum)
+
 def gen_face_with_expression(mu_face):
     E = basis_exp.shape[0]
     exp = torch.tensor(basis_exp)
-    ic(exp.size())
     alpha = torch.randn(E,1,1)/8
     face = mu_face + torch.sum(torch.mul(alpha, exp), dim=0)
-    ic(face.size())
     return face
     
 class VirtDataset(Dataset):
@@ -34,13 +38,13 @@ class VirtDataset(Dataset):
         return idx
 
 class AsmModel(pl.LightningModule):
-    def __init__(self, K, init_mu_face_rig, base_verts, tgt_verts, inited_gmm_params=None, lr=1e-4, alpha_mu=1e-5):
+    def __init__(self, K, init_mu_face_rig, base_verts, tgt_verts, inited_gmm_params=None, lr=1e-3, save_obj=False):
         super().__init__()
         J = len(init_mu_face_rig.bones_name)
         self.J = J
         self.K = K 
         self.lr = lr
-        self.alpha_mu = alpha_mu
+        self.save_obj = save_obj
         self.init_state = init_mu_face_rig
         self.mesh_uv_projecter = MeshUVProjecter(
             self.init_state.verts,
@@ -63,16 +67,14 @@ class AsmModel(pl.LightningModule):
         self.tau_so3 = nn.Parameter(so3, requires_grad=True)
         self.tau_translation = nn.Parameter(translation, requires_grad=True)
         if inited_gmm_params is None:
-            pi = Uniform(-0.1, 0.1).sample((J,K))
+            pi = Uniform(0, 10).sample((J,K))
             mu = Uniform(-0.1, 0.1).sample((J,K,2))
-            scale_tril = Uniform(-0.01, 0.01).sample((J,K,3))
+            scale_tril = Uniform(-1, 1).sample((J,K,3))
         else:
             params = inited_gmm_params
-            # ic(params)
             pi = torch.tensor(params["pi"])
             mu = torch.tensor(params["mu"])
             scale_tril = torch.tensor(params["scale_tril"])
-            ic(pi.size(), mu.size(), scale_tril.size())
         self.pi = nn.Parameter(pi, requires_grad=True)
         self.mu = nn.Parameter(mu, requires_grad=True)
         # sigma = LL^T, L 是一个下三角矩阵, 对角线元素为正数
@@ -105,9 +107,9 @@ class AsmModel(pl.LightningModule):
         x = self.verts_uvs.view(-1,1,2) # vert uvs, (V,1,2)
         log_prob = normal2.log_prob(x) # (V, J*K)
         prob = torch.exp(log_prob).view(-1, self.J, self.K)
-        pi = torch.softmax(self.pi, dim=-1) # (J, K)
+        pi = softweight(self.pi, dim=-1) # (J, K)
         w = torch.mul(pi, prob).sum(dim=-1) # (V, J)
-        wg = torch.softmax(w, dim=-1)
+        wg = softweight(w, dim=-1)
         return wg
     
     def bones_local2world(self):
@@ -158,10 +160,10 @@ class AsmModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         v = self(None)
-        loss_verts = F.mse_loss(v, self.tgt_verts)
-        reg_mu_loss = (self.alpha_mu / self.mu.view(-1, 2).size(0)) * torch.sum(self.mu**2)
-        loss = loss_verts + reg_mu_loss
+        loss = 1e4*F.mse_loss(v, self.tgt_verts)
         self.log("loss", loss, prog_bar=True)
+        if self.save_obj and batch_idx%100 == 0:
+            self.save_mesh(os.path.join(self.logger.log_dir, f"step_{batch_idx}.obj"))
         return loss
 
     def configure_optimizers(self):

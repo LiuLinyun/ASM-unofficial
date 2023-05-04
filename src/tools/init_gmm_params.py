@@ -24,7 +24,6 @@ class InitGmmModel(pl.LightningModule):
             self.asm_model.mu,
             self.asm_model.scale_tril,
         ]
-        self.alpha_mu = 1e-6
         self.lowest_loss = 99999.0
         self.lowest_loss_params = None
 
@@ -38,11 +37,9 @@ class InitGmmModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         w = self(None)
-        reg_mu_loss = self.alpha_mu * torch.norm(self.asm_model.mu)
-        loss = F.mse_loss(w, self.tgt_weights) + reg_mu_loss
+        loss = 1000 * F.mse_loss(w, self.tgt_weights)
         self.update_lowest_loss_params(loss)
         self.log("loss", loss, prog_bar=True)
-        self.log("reg_mu_loss", reg_mu_loss, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
