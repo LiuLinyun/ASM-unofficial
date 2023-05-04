@@ -23,7 +23,6 @@ class MeshUVProjecter():
         beta = s1 / s_total
         gamma = 1 - (alpha + beta)
         bary = torch.cat([alpha.view(-1,1), beta.view(-1,1), gamma.view(-1,1)], dim=1).view(-1, 3, 1)
-
         tri = self.tri_verts[tri_idx] # (N, 3, 3)
         return torch.sum(bary*tri, dim=1)
 

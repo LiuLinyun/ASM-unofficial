@@ -3,6 +3,7 @@ import random
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import MultivariateNormal
 from torch.utils.data import Dataset
 import pytorch_lightning as pl
 from pytorch3d import transforms as trans
@@ -14,10 +15,31 @@ from tools.read_write_obj import write_obj_file
 
 from icecream import ic
 
+class EmphasizedLoss(nn.Module):
+    def __init__(self, power=2):
+        super(EmphasizedLoss, self).__init__()
+        self.power = power
+
+    def forward(self, predictions, targets):
+        # Calculate the squared differences between predictions and targets
+        squared_diffs = (predictions - targets) ** 2
+
+        # Apply the power factor to emphasize larger distances
+        emphasized_loss = squared_diffs ** (self.power / 2)
+
+        # Average the emphasized loss across the batch
+        loss = torch.mean(emphasized_loss)
+
+        return loss
+
 def gen_face_with_expression(mu_face):
     E = basis_exp.shape[0]
-    face = mu_face + basis_exp[random.randint(0,E)]
-    return torch.tensor(face)
+    exp = torch.tensor(basis_exp)
+    ic(exp.size())
+    alpha = torch.randn(E,1,1)/8
+    face = mu_face + torch.sum(torch.mul(alpha, exp), dim=0)
+    ic(face.size())
+    return face
     
 class VirtDataset(Dataset):
     def __init__(self, cnt=1):
@@ -29,12 +51,12 @@ class VirtDataset(Dataset):
         return idx
 
 class AsmModel(pl.LightningModule):
-    def __init__(self, K, init_mu_face_rig, base_verts, tgt_verts):
+    def __init__(self, K, init_mu_face_rig, base_verts, tgt_verts, inited_gmm_params=None, alpha_mu=1e-5):
         super().__init__()
         J = len(init_mu_face_rig.bones_name)
         self.J = J
         self.K = K 
-        self.B = tgt_verts.size() # batch_sie
+        self.alpha_mu = alpha_mu
         self.base_verts = base_verts
         self.tgt_verts = tgt_verts
         self.init_state = init_mu_face_rig
@@ -47,19 +69,29 @@ class AsmModel(pl.LightningModule):
         # 可学习的参数
         zeta, scale, so3, translation = self.init_params()
         self.zeta = nn.Parameter(zeta.view(J,1,2), requires_grad=True)
-        self.pi = nn.Parameter(torch.ones(J,K), requires_grad=True)
-        self.mu = nn.Parameter(torch.zeros(J,K,2), requires_grad=True)
-        # 三个数分别表示正态分布协方差矩阵中的三个数 [rho*sigma_x*sigma_y, sigma_x^2, sigma_y^2] 
-        self.sigma = nn.Parameter(torch.ones(J,K,3), requires_grad=True)
         self.tau_scale = nn.Parameter(scale, requires_grad=True)
         # 用 so3 表示旋转
         self.tau_so3 = nn.Parameter(so3, requires_grad=True)
         self.tau_translation = nn.Parameter(translation, requires_grad=True)
+        if inited_gmm_params is None or K not in inited_gmm_params.keys():
+            pi = torch.rand(J,K)
+            mu = (torch.rand(J,K,2)-0.5)/100
+            scale_tril = torch.rand(J,K,3)
+        else:
+            params = inited_gmm_params[K]
+            pi = torch.tensor(params["pi"])
+            mu = torch.tensor(params["mu"])
+            scale_tril = torch.tensor(params["scale_tril"])
+        self.pi = nn.Parameter(pi, requires_grad=True)
+        self.mu = nn.Parameter(mu, requires_grad=True)
+        # sigma = LL^T, L 是一个下三角矩阵, 对角线元素为正数
+        self.scale_tril = nn.Parameter(scale_tril, requires_grad=True)
+        
 
     def init_params(self):
         # 获得骨骼初始的 UV 坐标, 以初始化 zeta
         zeta = self.init_state.uv_coords[self.init_state.verts_uv_indices[self.init_state.bones_tail_idx]]
-
+        ic(torch.min(zeta), torch.max(zeta))
         # 获得骨骼初始的局部变换矩阵 
         # B_{curr}^{l2w} = B_{parent}^{l2w} T_{curr}^{local}
         # 获得 T_{curr}^{local} 之后初始化 tau
@@ -81,25 +113,25 @@ class AsmModel(pl.LightningModule):
         so3 = trans.so3_log_map(R.transpose(-1,-2))
         T = M_local[:,:3,3]
         return zeta, s.view(-1,3), so3, T
-
+    
     def gmm_weighting(self):
-        mu = (self.mu + self.zeta) # (J, K, 2)
-        # x-mu: (V, 1, 2) - (J*K, 2) -> (V, J*K, 2)
-        x_mu = self.init_state.bones_uvs.view(-1,1,2) - mu.view(-1,2)
-        # (J, K, 1) -> (J, K, 4) -> (J, K, 2, 2)
-        sigma_mat = torch.cat([self.sigma[:,:,[1]], self.sigma[:,:,[0]], 
-            self.sigma[:,:,[0]], self.sigma[:,:,[2]]], dim = -1).view(self.J, self.K, 2, 2)
-        # 1/(2*pi*|Sigma|^0.5) , shape (J, K)
-        inv_2pi_sqrt_sigma_det = 1 / ((2*torch.pi) * torch.sqrt(torch.det(sigma_mat)))
-        pi = self.pi / torch.sum(self.pi, dim=1, keepdim=True) # (J, K), normalize pi
-        # (J,K) -> (J*K, 1) 
-        pi_alpha = (pi*inv_2pi_sqrt_sigma_det).view(-1,1)
-        # (V, J*K, 1, 2) @ (J*K,2,2) @ (V, J*K, 2, 1) -> (V, J*K, 1)
-        index = x_mu.unsqueeze(-2).matmul(sigma_mat.view(-1,2,2)).matmul(x_mu.unsqueeze(-1)).squeeze(-1) / (-2)
-        # (V, J, K)
-        w = torch.mul(pi_alpha, torch.exp(index)).reshape(-1, self.J, self.K)
-        wg = torch.div(w, torch.sum(w, dim=-1, keepdim=True)).squeeze(-1) # (V, J)
+        mu = (self.mu + self.zeta).view(-1,2) # (J*K, 2)
+        tril = self.scale_tril.view(-1,3) # (J*K,3)
+        diag = F.softplus(tril[:,:2]) # 对角线大于 0
+        t11 = tril[:,[2]]
+        zeros = torch.zeros_like(t11)
+        # (J*K, 2, 2)
+        scale_tril_mat = torch.cat([diag[:,[0]], zeros, 
+                                    t11, diag[:,[1]]], dim=-1).view(-1, 2, 2)
+        normal2 = MultivariateNormal(mu, scale_tril=scale_tril_mat)
+        x = self.init_state.verts_uvs.view(-1,1,2) # vert uvs, (V,1,2)
+        log_prob = normal2.log_prob(x) # (V, J*K)
+        prob = torch.exp(log_prob).view(-1, self.J, self.K)
+        pi = F.softmax(self.pi, dim=-1) # (J, K), normalize pi
+        w = torch.mul(pi, prob).sum(dim=-1) # (V, J)
+        wg = torch.div(w, torch.sum(w, dim=-1, keepdim=True)) # (V, J)
         return wg
+
 
     def bones_local2world(self):
         trans_mat_dict = {}
@@ -148,8 +180,9 @@ class AsmModel(pl.LightningModule):
         B_inv = self.dyn_binding() # (J, 4, 4)
         v = self.init_state.verts # (V,3)
         combined_trans = trans.Transform3d(matrix=torch.matmul(M_l2w,B_inv).transpose(-1,-2))
-        v_weighted = combined_trans.transform_points(v)
-        v_updated = torch.sum(v_weighted, dim=0)
+        v_transed = combined_trans.transform_points(v) # (J, V, 3)
+        v_weighted = W.T.unsqueeze(-1) * v_transed # (J, V, 3)
+        v_updated = torch.sum(v_weighted, dim=0) # (V, 3)
         return v_updated
     
     def save_mesh(self, path):
@@ -182,26 +215,44 @@ class AsmModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         v = self(None)
-        loss = F.mse_loss(v, self.tgt_verts)
+        loss_verts = F.mse_loss(v, self.tgt_verts)
+        # reg_mu_loss = (self.alpha_mu / self.mu.view(-1, 2).size(0)) * torch.sum(self.mu**2)
+        loss = loss_verts # + reg_mu_loss
         self.log("loss", loss, prog_bar=True)
-        with torch.no_grad():
-            dist = torch.cdist(v, self.tgt_verts)
-            max_dist = torch.max(dist)
-            self.log("max_dist", max_dist, prog_bar=True)
+        # self.log("reg_mu_loss", reg_mu_loss, prog_bar=True)
+        # with torch.no_grad():
+        #     dist = torch.cdist(v, self.tgt_verts)
+        #     max_dist = torch.max(dist)
+        #     self.log("max_dist", max_dist, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=0.01)
+        default_lr = 1e-3
+        params = [
+            {"params": self.zeta, "lr": default_lr},
+            {"params": self.tau_scale, "lr": default_lr},
+            {"params": self.tau_so3, "lr": default_lr},
+            {"params": self.tau_translation, "lr": default_lr},
+            {"params": self.pi, "lr": default_lr},
+            {"params": self.mu, "lr": default_lr},
+            {"params": self.scale_tril, "lr": default_lr},
+        ]
+        optimizer = torch.optim.AdamW(params, lr=default_lr)
         return optimizer
 
 if __name__ == "__main__":
+    import pickle
     muface_rig = InitMuFaceRig("data/rig_info.json", "data/mu_face.obj")
     tgt_verts = gen_face_with_expression(muface_rig.verts)
-    model = AsmModel(15, muface_rig, base_verts=muface_rig.verts, tgt_verts=tgt_verts)
+    inited_gmm_params = pickle.load(open("data/inited_gmm_params.pkl", "rb"))
+    model = AsmModel(3, muface_rig, base_verts=muface_rig.verts, tgt_verts=tgt_verts, inited_gmm_params=inited_gmm_params)
+    Wg = model.gmm_weighting()
     M1 = model.bones_local2world()
     M2 = model.dyn_binding()
-    v = model.init_state.verts
-    v_ = model.update_verts()
-    cos_dist = torch.cosine_similarity(v, v_)
-    ic(cos_dist)
+    # M = M1.matmul(M2)
+    # ic(M)
+    # v = model.init_state.verts
+    # v_ = model.update_verts()
+    # cos_dist = torch.cosine_similarity(v, v_)
+    # ic(cos_dist)
 
