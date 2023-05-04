@@ -3,6 +3,7 @@
 
 
 ## 如何运行
+0. 配置运行环境: 当前项目依赖 pytorch=2.0, pytorch3d=0.7, pytorch_lightning=2.0 三个库, 可以使用 pip 或 conda 自行安装(推荐使用conda)
 1. 下载 HIFI3D++ 三维人脸数据集, 命名为 "hifi3dpp.mat", 放到 data 文件夹中
 2. (可选) 运行 `python src/tools/init_gmm_params.py` 获取 Blender 初始蒙皮权重对应的二维正态分布参数, 将会在 data 文件夹中生成对应的参数文件 `inited_gmm_params_K*.pkl` 
 3. 运行 `python src/train.py` 拟合添加随机特定表情的人脸形状, 拟合好的 Mesh 文件将会保存为 `data/output/optimized.obj`
