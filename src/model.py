@@ -34,11 +34,12 @@ class VirtDataset(Dataset):
         return idx
 
 class AsmModel(pl.LightningModule):
-    def __init__(self, K, init_mu_face_rig, base_verts, tgt_verts, inited_gmm_params=None, alpha_mu=1e-5):
+    def __init__(self, K, init_mu_face_rig, base_verts, tgt_verts, inited_gmm_params=None, lr=1e-4, alpha_mu=1e-5):
         super().__init__()
         J = len(init_mu_face_rig.bones_name)
         self.J = J
         self.K = K 
+        self.lr = lr
         self.alpha_mu = alpha_mu
         self.init_state = init_mu_face_rig
         self.mesh_uv_projecter = MeshUVProjecter(
@@ -56,23 +57,41 @@ class AsmModel(pl.LightningModule):
         self.tgt_verts = nn.Parameter(tgt_verts, requires_grad=False)
         # 可学习的参数
         self.zeta = nn.Parameter(self.init_state.bones_uvs.view(-1,1,2), requires_grad=True) # (J,1,2)
-        self.tau_scale = nn.Parameter(torch.ones(J,3), requires_grad=True) # (J,3)
+        scale, so3, translation = self.init_tau_params()
+        self.tau_scale = nn.Parameter(scale, requires_grad=True) # (J,3)
         # 用 so3 表示旋转
-        self.tau_so3 = nn.Parameter(torch.zeros(J,3), requires_grad=True)
-        self.tau_translation = nn.Parameter(torch.zeros(J,3), requires_grad=True)
-        if inited_gmm_params is None or K not in inited_gmm_params.keys():
-            pi = torch.rand(J,K)*2 - 1
-            mu = (torch.rand(J,K,2)-0.5)/100
-            scale_tril = torch.rand(J,K,3)
+        self.tau_so3 = nn.Parameter(so3, requires_grad=True)
+        self.tau_translation = nn.Parameter(translation, requires_grad=True)
+        if inited_gmm_params is None:
+            pi = Uniform(-0.1, 0.1).sample((J,K))
+            mu = Uniform(-0.1, 0.1).sample((J,K,2))
+            scale_tril = Uniform(-0.01, 0.01).sample((J,K,3))
         else:
-            params = inited_gmm_params[K]
+            params = inited_gmm_params
+            # ic(params)
             pi = torch.tensor(params["pi"])
             mu = torch.tensor(params["mu"])
             scale_tril = torch.tensor(params["scale_tril"])
+            ic(pi.size(), mu.size(), scale_tril.size())
         self.pi = nn.Parameter(pi, requires_grad=True)
         self.mu = nn.Parameter(mu, requires_grad=True)
         # sigma = LL^T, L 是一个下三角矩阵, 对角线元素为正数
         self.scale_tril = nn.Parameter(scale_tril, requires_grad=True)
+
+    def init_tau_params(self):
+        # 将所有骨骼的父骨骼更改为根骨骼(头部内部)
+        # M_tau = M_local2root = M_obj2root M_local2obj = M_root2obj^{-1} M_local2obj
+        # M_root2obj = self.M_root_local2obj
+        # M_local2obj = self.bones_M_local2obj
+        M_local2root = self.M_root_local2obj.inverse().matmul(self.bones_M_local2obj)
+
+        # 分解变换矩阵, 得到位移, 旋转, 缩放
+        sR = M_local2root[:,:3,:3]
+        s = torch.norm(sR, dim=1, keepdim=True)
+        R = sR / s
+        so3 = trans.so3_log_map(R.transpose(-1,-2))
+        T = M_local2root[:,:3,3]
+        return s.view(-1,3), so3, T
     
     def gmm_weighting(self):
         mu = (self.mu + self.zeta).view(-1,2) # (J*K, 2)
@@ -86,18 +105,17 @@ class AsmModel(pl.LightningModule):
         x = self.verts_uvs.view(-1,1,2) # vert uvs, (V,1,2)
         log_prob = normal2.log_prob(x) # (V, J*K)
         prob = torch.exp(log_prob).view(-1, self.J, self.K)
-        pi = torch.div(self.pi, torch.sum(self.pi, dim=-1, keepdim=True))
+        pi = torch.softmax(self.pi, dim=-1) # (J, K)
         w = torch.mul(pi, prob).sum(dim=-1) # (V, J)
-        wg = torch.div(w, torch.sum(w, dim=-1, keepdim=True)) # (V, J)
+        wg = torch.softmax(w, dim=-1)
         return wg
     
     def bones_local2world(self):
         trans_tau = trans.Scale(self.tau_scale).compose(
             trans.Rotate(trans.so3_exp_map(self.tau_so3))).compose(
-            trans.Translate(self.tau_translation)
-        )
+            trans.Translate(self.tau_translation))
         M_tau = trans_tau.get_matrix().transpose(-1,-2)
-        M_l2w = torch.matmul(self.bones_M_local2obj, M_tau)
+        M_l2w = torch.matmul(self.M_root_local2obj, M_tau)
         return M_l2w
         
     
@@ -140,38 +158,21 @@ class AsmModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         v = self(None)
-        loss_verts = F.mse_loss(v, self.tgt_verts) #, reduction="sum")
+        loss_verts = F.mse_loss(v, self.tgt_verts)
         reg_mu_loss = (self.alpha_mu / self.mu.view(-1, 2).size(0)) * torch.sum(self.mu**2)
-        # reg_tau_quat_loss = (1 / self.tau_quat.view(-1,4).size(0)) * torch.sum(torch.sum(self.tau_quat**2, dim=-1) - 1)
-        loss = loss_verts + reg_mu_loss  # + reg_tau_quat_loss
+        loss = loss_verts + reg_mu_loss
         self.log("loss", loss, prog_bar=True)
-        # self.log("reg_mu_loss", reg_mu_loss, prog_bar=True)
-        # self.log("reg_tau_loss", reg_tau_quat_loss, prog_bar=True)
-        # with torch.no_grad():
-        #     dist = torch.cdist(v, self.tgt_verts)
-        #     max_dist = torch.max(dist)
-        #     self.log("max_dist", max_dist, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
-        default_lr = 1e-3
-        params = [
-            {"params": self.zeta, "lr": default_lr},
-            {"params": self.tau_scale, "lr": default_lr},
-            {"params": self.tau_so3, "lr": default_lr},
-            {"params": self.tau_translation, "lr": default_lr},
-            {"params": self.pi, "lr": default_lr},
-            {"params": self.mu, "lr": default_lr},
-            {"params": self.scale_tril, "lr": default_lr},
-        ]
-        optimizer = torch.optim.AdamW(params, lr=default_lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
         return optimizer
 
 if __name__ == "__main__":
     import pickle
     muface_rig = InitMuFaceRig("data/rig_info.json", "data/mu_face.obj")
     tgt_verts = gen_face_with_expression(muface_rig.verts)
-    inited_gmm_params = pickle.load(open("data/inited_gmm_params.pkl", "rb"))
+    inited_gmm_params = pickle.load(open("data/inited_gmm_params_K3.pkl", "rb"))
     model = AsmModel(3, muface_rig, base_verts=muface_rig.verts, tgt_verts=tgt_verts, inited_gmm_params=inited_gmm_params)
     Wg = model.gmm_weighting()
     M1 = model.bones_local2world()

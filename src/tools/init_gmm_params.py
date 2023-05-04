@@ -13,8 +13,6 @@ import sys
 sys.path.append(parent_path)
 from model import AsmModel, InitMuFaceRig, VirtDataset
 
-
-
 class InitGmmModel(pl.LightningModule):
     def __init__(self, K, mu_face_rig, weights_map):
         super().__init__()
@@ -26,7 +24,7 @@ class InitGmmModel(pl.LightningModule):
             self.asm_model.mu,
             self.asm_model.scale_tril,
         ]
-        self.alpha_mu = 1e-3
+        self.alpha_mu = 1e-6
         self.lowest_loss = 99999.0
         self.lowest_loss_params = None
 
@@ -41,14 +39,14 @@ class InitGmmModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         w = self(None)
         reg_mu_loss = self.alpha_mu * torch.norm(self.asm_model.mu)
-        loss = 100*F.mse_loss(w, self.tgt_weights) + reg_mu_loss
+        loss = F.mse_loss(w, self.tgt_weights) + reg_mu_loss
         self.update_lowest_loss_params(loss)
         self.log("loss", loss, prog_bar=True)
         self.log("reg_mu_loss", reg_mu_loss, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.params, lr=0.04)
+        optimizer = torch.optim.AdamW(self.params, lr=0.01)
         return optimizer
 
 if __name__ == "__main__":
@@ -56,10 +54,10 @@ if __name__ == "__main__":
     weights_map = pickle.load(open("data/weights_map.pkl", "rb"))
     dataset = VirtDataset(1000)
     data_loader = DataLoader(dataset, batch_size=1)
-    for K in range(3,4):
+    for K in range(2,6):
         print(f"init param with K={K}")
         init_gmm_model = InitGmmModel(K, muface_rig, weights_map)
-        trainer = pl.Trainer(max_epochs=1, devices=1, accelerator="gpu")
+        trainer = pl.Trainer(gradient_clip_val=1, max_epochs=1, devices=1, accelerator="gpu")
         trainer.fit(init_gmm_model, train_dataloaders=data_loader)
         inited_params = {
             "pi": init_gmm_model.lowest_loss_params[0].detach().cpu().numpy(),
